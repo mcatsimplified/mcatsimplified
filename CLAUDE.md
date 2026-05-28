@@ -26,12 +26,70 @@ HTML-native video workspace built on [Hyperframes](https://hyperframes.heygen.co
 
 If `MOTION_PHILOSOPHY.md` is missing from the workspace root, stop and ask Nate before brainstorming — it should always be there.
 
+## Full Video Production Pipeline
+
+**Three-stage pipeline: raw footage → clean edit → motion graphics.**
+
+```
+[1] RAW VIDEO
+       ↓  /video-use skill
+[2] CLEAN CUT  (fillers removed, silences trimmed, color-graded, subtitles burned)
+       ↓  /hyperframes skill
+[3] FINAL VIDEO  (motion graphics, lower thirds, kinetic titles, transitions)
+```
+
+### Stage 1 → 2: video-use (filler removal + editing)
+
+**Skill:** `/video-use` — invoke before any editing session on raw footage.
+
+**What it does:**
+- Transcribes with ElevenLabs Scribe (word-level timestamps)
+- Removes filler words (`umm`, `uh`, false starts) and silence gaps
+- Applies color grading per-segment; 30ms audio fades at cut points
+- Burns in subtitles (2-word UPPERCASE chunks by default)
+- Outputs `edit/final.mp4` inside the project folder
+
+**How to invoke:** drop raw footage into `video-projects/<name>/assets/`, then tell Claude:
+> "Edit `assets/raw.mp4` — remove fillers and silence, keep the teaching content."
+
+**Requires:** `ELEVENLABS_API_KEY` in `~/Developer/video-use/.env` (see Setup below).
+
+**Helper scripts** (run from `~/Developer/video-use/` with `uv run`):
+```bash
+uv run helpers/transcribe.py <video>         # word-level transcript → takes_packed.md
+uv run helpers/pack_transcripts.py <dir>     # pack multi-take transcripts
+uv run helpers/render.py <edl.json> <src>    # execute an Edit Decision List
+uv run helpers/grade.py <video>              # color grade
+uv run helpers/timeline_view.py <edl.json>   # visualize cut timeline
+```
+
+**Key artifacts produced:**
+- `edit/takes_packed.md` — phrase-level transcript with time ranges
+- `edit/edl.json` — cut decisions with source timings and reasoning
+- `edit/project.md` — session memory (appended chronologically)
+- `edit/final.mp4` — the clean edited output
+
+**video-use hard rules (enforced by the skill):**
+1. Per-segment extract + lossless concat — never single-pass filtering
+2. 30ms audio fades at every segment boundary
+3. Subtitles applied last in the filter chain
+4. Never cut inside a word — snap to word boundaries
+5. Cache transcripts per source — never re-transcribe the same file
+6. All outputs go to `<project>/edit/`, never overwrite the source
+
+### Stage 2 → 3: HyperFrames (motion graphics)
+
+After `edit/final.mp4` is produced, reference it as `<video src="edit/final.mp4">` inside the HyperFrames composition. Build lower thirds, kinetic titles, transitions, and overlays on top. See the Authoring Loop and Render Contract sections below.
+
+---
+
 ## Skills — USE THESE FIRST
 
 **Always invoke the matching skill before writing or modifying compositions.** Skills encode framework-specific patterns (`window.__timelines` registration, `data-*` attribute semantics, shader-compatible CSS, relative-timing syntax) that are NOT in generic web docs. Skipping them produces broken compositions.
 
 | Skill                    | Command                    | When to use                                                                               |
 | ------------------------ | -------------------------- | ----------------------------------------------------------------------------------------- |
+| `video-use`              | `/video-use`               | Raw footage editing — filler removal, silence trimming, subtitles, color grade            |
 | `hyperframes`            | `/hyperframes`             | Authoring/editing compositions, captions, TTS, audio-reactive animation, transitions      |
 | `hyperframes-cli`        | `/hyperframes-cli`         | CLI commands: `init`, `add`, `lint`, `preview`, `render`, `transcribe`, `tts`, `doctor`   |
 | `gsap`                   | `/gsap`                    | GSAP animation — timelines, easing, stagger, ScrollTrigger, plugins, performance          |
@@ -39,6 +97,31 @@ If `MOTION_PHILOSOPHY.md` is missing from the workspace root, stop and ask Nate 
 | `website-to-hyperframes` | `/website-to-hyperframes`  | Turning a URL into a composition (7-step capture-to-video pipeline)                       |
 
 Not present? `npx skills add heygen-com/hyperframes --yes` then reopen this directory.
+For video-use: `git clone https://github.com/browser-use/video-use ~/Developer/video-use && ln -sfn ~/Developer/video-use ~/.claude/skills/video-use`
+
+## video-use Setup
+
+**Installed at:** `~/Developer/video-use` (symlinked into `~/.claude/skills/video-use`)
+
+**One-time setup:**
+```bash
+# Already done in this environment:
+cd ~/Developer/video-use
+uv sync                          # Python deps installed
+# ffmpeg installed via apt
+
+# Required — add your key:
+echo "ELEVENLABS_API_KEY=your_key_here" > ~/Developer/video-use/.env
+```
+
+**Get an ElevenLabs API key:** https://elevenlabs.io/app/settings/api-keys (free tier works for transcription).
+
+**Verify setup:**
+```bash
+cd ~/Developer/video-use
+uv run helpers/transcribe.py --help
+ffmpeg -version
+```
 
 ## Commands
 
