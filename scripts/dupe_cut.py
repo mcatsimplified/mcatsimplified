@@ -25,40 +25,33 @@ What it keeps:
 import argparse
 import re
 import sys
-import tempfile
 from difflib import SequenceMatcher
 from pathlib import Path
 
 
 # ── Transcription ─────────────────────────────────────────────────────────────
 
-def extract_audio(video_path: str, dest: str) -> None:
+def load_audio_array(video_path: str) -> "np.ndarray":
+    """
+    Extract audio from a video using MoviePy and return a float32 mono array
+    at 16 kHz — the format Whisper expects. No ffmpeg on PATH required.
+    """
     from moviepy import VideoFileClip
     import numpy as np
-    import wave
 
     clip = VideoFileClip(video_path)
     if clip.audio is None:
         clip.close()
         raise ValueError(f"No audio track found in {video_path}")
 
-    # Whisper wants mono 16 kHz PCM — resample via to_soundarray then write WAV
-    TARGET_FPS = 16_000
-    samples = clip.audio.to_soundarray(fps=TARGET_FPS)
+    samples = clip.audio.to_soundarray(fps=16_000)
     clip.close()
 
-    # Mix down to mono
     if samples.ndim > 1:
         samples = samples.mean(axis=1)
 
-    # Normalise to int16 range and clamp to avoid overflow
-    pcm = np.clip(samples * 32767, -32768, 32767).astype(np.int16)
-
-    with wave.open(dest, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)          # 16-bit = 2 bytes
-        wf.setframerate(TARGET_FPS)
-        wf.writeframes(pcm.tobytes())
+    # Whisper expects float32 in the range [-1, 1]
+    return samples.astype("float32")
 
 
 def transcribe(video_path: str, model_name: str) -> list[dict]:
@@ -74,15 +67,12 @@ def transcribe(video_path: str, model_name: str) -> list[dict]:
     print(f"Loading Whisper '{model_name}' model  (downloads on first use)...")
     model = whisper.load_model(model_name)
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    tmp.close()
-    try:
-        print("Extracting audio...")
-        extract_audio(video_path, tmp.name)
-        print("Transcribing with word-level timestamps...")
-        result = model.transcribe(tmp.name, word_timestamps=True, language="en")
-    finally:
-        Path(tmp.name).unlink(missing_ok=True)
+    print("Extracting audio...")
+    audio = load_audio_array(video_path)
+
+    # Pass the numpy array directly — bypasses Whisper's internal ffmpeg call
+    print("Transcribing with word-level timestamps...")
+    result = model.transcribe(audio, word_timestamps=True, language="en")
 
     words = []
     for segment in result["segments"]:
