@@ -1,158 +1,163 @@
 #!/usr/bin/env python3
 """
-dupe_cut.py — Remove spoken duplicate words, stuttered phrases, and repeated
-              sentences from a video using Whisper + MoviePy.
+dupe_cut.py — Remove back-to-back duplicate sentences and phrases from a video.
 
-Requires:
+Requirements:
     pip install openai-whisper moviepy
-    ffmpeg on PATH (already installed in this workspace)
 
 Usage:
-    python scripts/dupe_cut.py input.mp4
-    python scripts/dupe_cut.py input.mp4 -o clean.mp4
-    python scripts/dupe_cut.py input.mp4 --model small --min-similarity 0.80
-    python scripts/dupe_cut.py input.mp4 --dry-run   # print cuts without editing
-
-What it detects (all back-to-back within --max-gap seconds):
-    Single-word stutter  :  "I... I want to"
-    Phrase stutter       :  "the enzyme the enzyme kinetics"
-    Sentence repeat      :  "This is important. This is important."
-
-What it keeps:
-    The SECOND occurrence (the intended version). The first is cut.
+    py dupe_cut.py input.mp4
+    py dupe_cut.py input.mp4 -o clean.mp4
+    py dupe_cut.py input.mp4 -o clean.mp4 --threshold 0.75
+    py dupe_cut.py input.mp4 --dry-run
 """
 
 import argparse
-import re
 import sys
+import tempfile
+import wave
 from difflib import SequenceMatcher
 from pathlib import Path
 
+import numpy as np
 
-# ── Transcription ─────────────────────────────────────────────────────────────
 
-def load_audio_array(video_path: str) -> "np.ndarray":
+# ── Stage 1: Audio extraction ─────────────────────────────────────────────────
+
+def extract_audio(video_path: str) -> np.ndarray:
     """
-    Extract audio from a video using MoviePy and return a float32 mono array
-    at 16 kHz — the format Whisper expects. No ffmpeg on PATH required.
+    Use MoviePy to write a 16 kHz mono WAV, then read it back with the stdlib
+    wave module. Returns a float32 numpy array normalized to [-1, 1].
+
+    MoviePy ships with imageio_ffmpeg (a self-contained bundled ffmpeg binary),
+    so no system-level ffmpeg install is required on Windows or any platform.
+    The stdlib wave reader that follows is pure Python — no external deps at all.
     """
     from moviepy import VideoFileClip
-    import numpy as np
 
+    print("Extracting audio...")
     clip = VideoFileClip(video_path)
+
     if clip.audio is None:
         clip.close()
-        raise ValueError(f"No audio track found in {video_path}")
+        sys.exit(f"Error: no audio track found in '{video_path}'.")
 
-    samples = clip.audio.to_soundarray(fps=16_000)
-    clip.close()
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
 
-    if samples.ndim > 1:
-        samples = samples.mean(axis=1)
+    try:
+        # write_audiofile uses MoviePy's bundled imageio_ffmpeg — not system ffmpeg
+        clip.audio.write_audiofile(
+            tmp.name,
+            fps=16_000,
+            nbytes=2,               # 16-bit PCM
+            codec="pcm_s16le",
+            logger=None,            # suppress moviepy progress bar
+        )
+        clip.close()
 
-    samples = samples.astype(np.float32)
+        # Read back with Python's built-in wave module — zero external dependencies
+        with wave.open(tmp.name, "rb") as wf:
+            n_channels = wf.getnchannels()
+            raw = wf.readframes(wf.getnframes())
 
-    # MoviePy may return int16-range values (~±32768) or float values (~±1.0).
-    # Whisper requires float32 strictly in [-1, 1] — anything outside that range
-    # is treated as clipped noise and Whisper returns no speech.
-    peak = np.abs(samples).max()
-    if peak > 1.0:
-        samples = samples / peak          # int16-range → float range
-    elif 0 < peak < 0.01:
-        samples = samples / peak * 0.9    # inaudibly quiet → boost it
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
 
-    print(f"Audio: {len(samples)/16_000:.1f}s, peak={peak:.4f}, "
-          f"normalized_peak={np.abs(samples).max():.4f}")
+        # Mix stereo → mono
+        if n_channels > 1:
+            samples = samples.reshape(-1, n_channels).mean(axis=1)
 
-    return np.ascontiguousarray(samples)
+        # Normalize to [-1, 1] — Whisper silently returns nothing if out of range
+        peak = np.abs(samples).max()
+        if peak > 0:
+            samples /= peak
+
+        print(f"Audio: {len(samples) / 16_000:.1f}s  |  peak={peak:.0f}  |  "
+              f"normalized peak={np.abs(samples).max():.4f}")
+        return np.ascontiguousarray(samples)
+
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
 
 
-def transcribe(video_path: str, model_name: str) -> list[dict]:
+# ── Stage 2: Transcription ────────────────────────────────────────────────────
+
+def transcribe(audio: np.ndarray, model_name: str) -> list[dict]:
     """
-    Return [{word, start, end}, …] using Whisper word-level timestamps.
-    Models download on first use (~74 MB for base, ~461 MB for small).
+    Transcribe using Whisper at segment level (full sentences/phrases with
+    start + end timestamps). Passing a numpy array bypasses Whisper's internal
+    ffmpeg call, keeping us fully ffmpeg-on-PATH independent.
     """
     try:
         import whisper
     except ImportError:
         sys.exit("openai-whisper not installed. Run: pip install openai-whisper")
 
-    print(f"Loading Whisper '{model_name}' model  (downloads on first use)...")
+    print(f"\nLoading Whisper '{model_name}' model (downloads ~74 MB on first use)...")
     model = whisper.load_model(model_name)
 
-    print("Extracting audio...")
-    audio = load_audio_array(video_path)
+    print("Transcribing (this takes a while on CPU — grab a coffee)...")
+    result = model.transcribe(
+        audio,
+        word_timestamps=False,   # segment-level only — faster and enough for phrase matching
+        language="en",
+    )
 
-    # Pass the numpy array directly — bypasses Whisper's internal ffmpeg call
-    print("Transcribing with word-level timestamps...")
-    result = model.transcribe(audio, word_timestamps=True, language="en")
-
-    words = []
-    for segment in result["segments"]:
-        for w in segment.get("words", []):
-            clean = re.sub(r"[^\w'-]", "", w["word"]).strip().lower()
-            if clean:
-                words.append({"word": clean, "start": float(w["start"]), "end": float(w["end"])})
-
-    return words
-
-
-# ── Duplicate detection ───────────────────────────────────────────────────────
-
-def normalize(word: str) -> str:
-    return re.sub(r"[^\w]", "", word).lower()
+    segments = [
+        {"start": float(s["start"]), "end": float(s["end"]), "text": s["text"].strip()}
+        for s in result["segments"]
+        if s["text"].strip()
+    ]
+    print(f"Transcript: {len(segments)} segment(s) detected.\n")
+    return segments
 
 
-def phrase_sim(a: list[dict], b: list[dict]) -> float:
-    a_str = " ".join(normalize(w["word"]) for w in a)
-    b_str = " ".join(normalize(w["word"]) for w in b)
-    return SequenceMatcher(None, a_str, b_str).ratio()
+# ── Stage 3: Duplicate detection ──────────────────────────────────────────────
+
+def phrase_similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a.strip().lower(), b.strip().lower()).ratio()
 
 
 def find_cuts(
-    words: list[dict],
-    max_phrase_len: int,
-    min_similarity: float,
-    max_gap: float,
+    segments: list[dict],
+    threshold: float,
+    max_window: int,
 ) -> list[tuple[float, float]]:
     """
-    Scan for back-to-back repeated phrases. Returns (start, end) pairs to cut.
+    Walk the segment list looking for back-to-back repeated phrases.
+    Checks windows of 1 → max_window consecutive segments so it catches
+    both single-sentence stutters and multi-sentence re-takes.
 
-    At each position we try phrase windows from longest→shortest so that
-    multi-word phrase matches are preferred over single-word matches inside them.
-    When a repeat is found the FIRST occurrence is marked for removal and we
-    advance past it — the next iteration starts at the intended (second) version.
+    The FIRST occurrence is always marked for removal; the second (the
+    speaker's intended version) is kept.
     """
     cuts = []
     i = 0
 
-    while i < len(words):
+    while i < len(segments):
         matched = False
-        max_window = min(max_phrase_len, (len(words) - i) // 2)
 
-        for n in range(max_window, 0, -1):
-            a = words[i : i + n]
-            b = words[i + n : i + 2 * n]
+        # Try larger windows first so multi-segment matches beat single-word ones
+        for n in range(min(max_window, len(segments) - i), 0, -1):
+            a_segs = segments[i : i + n]
+            b_segs = segments[i + n : i + 2 * n]
 
-            if len(b) < n:
+            if len(b_segs) < n:
                 continue
 
-            # Skip if the gap between the two occurrences is suspiciously large
-            gap = b[0]["start"] - a[-1]["end"]
-            if gap > max_gap:
-                continue
+            a_text = " ".join(s["text"] for s in a_segs)
+            b_text = " ".join(s["text"] for s in b_segs)
+            sim = phrase_similarity(a_text, b_text)
 
-            sim = phrase_sim(a, b)
-            if sim >= min_similarity:
-                cut_start = a[0]["start"]
-                cut_end   = a[-1]["end"]
-                a_text = " ".join(w["word"] for w in a)
-                b_text = " ".join(w["word"] for w in b)
-                label = "stutter" if n == 1 else f"{n}-word phrase"
-                print(f"  [{cut_start:.2f}s–{cut_end:.2f}s]  {label}  "
-                      f"cut: '{a_text}'  →  keep: '{b_text}'  (sim={sim:.0%})")
+            if sim >= threshold:
+                cut_start = a_segs[0]["start"]
+                cut_end   = a_segs[-1]["end"]
+                label     = "sentence" if n == 1 else f"{n}-segment phrase"
+                preview   = a_text[:70] + ("…" if len(a_text) > 70 else "")
+                print(f"  [{cut_start:.2f}s – {cut_end:.2f}s]  {label}  "
+                      f"sim={sim:.0%}  →  cut: \"{preview}\"")
                 cuts.append((cut_start, cut_end))
-                i += n          # skip the first (cut) occurrence
+                i += n        # land on the kept (second) version
                 matched = True
                 break
 
@@ -162,36 +167,40 @@ def find_cuts(
     return cuts
 
 
-def merge_adjacent(cuts: list[tuple[float, float]], slop: float = 0.08) -> list[tuple[float, float]]:
-    """Merge cuts that are within `slop` seconds of each other."""
+# ── Stage 4: Video splicing ───────────────────────────────────────────────────
+
+def merge_adjacent(cuts: list[tuple[float, float]], slop: float = 0.1) -> list[tuple[float, float]]:
+    """Merge cut regions that are within slop seconds of each other."""
     if not cuts:
         return []
-    out = [list(cuts[0])]
-    for start, end in cuts[1:]:
-        if start - out[-1][1] <= slop:
-            out[-1][1] = max(out[-1][1], end)
+    merged = [list(cuts[0])]
+    for s, e in cuts[1:]:
+        if s - merged[-1][1] <= slop:
+            merged[-1][1] = max(merged[-1][1], e)
         else:
-            out.append([start, end])
-    return [(s, e) for s, e in out]
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
 
 
-def cuts_to_keep(cuts: list[tuple[float, float]], total: float, pad: float) -> list[tuple[float, float]]:
-    """Invert cut regions → keep regions, with `pad` seconds of cushion at each edge."""
+def cuts_to_keep(
+    cuts: list[tuple[float, float]],
+    total: float,
+    padding: float,
+) -> list[tuple[float, float]]:
+    """Invert a list of cut regions into a list of keep regions."""
     keep = []
     cursor = 0.0
     for cut_start, cut_end in cuts:
-        seg_end = max(cursor, cut_start - pad)
-        if seg_end - cursor > 0.02:
+        seg_end = max(cursor, cut_start - padding)
+        if seg_end - cursor > 0.05:           # skip micro-fragments < 50ms
             keep.append((cursor, seg_end))
-        cursor = min(total, cut_end + pad)
-    if total - cursor > 0.02:
+        cursor = min(total, cut_end + padding)
+    if total - cursor > 0.05:
         keep.append((cursor, total))
     return keep
 
 
-# ── Video editing ─────────────────────────────────────────────────────────────
-
-def edit_video(
+def export_video(
     input_path: str,
     output_path: str,
     cuts: list[tuple[float, float]],
@@ -202,14 +211,15 @@ def edit_video(
     clip = VideoFileClip(input_path)
     keep = cuts_to_keep(cuts, clip.duration, padding)
 
-    removed_s = sum(e - s for s, e in cuts)
-    print(f"\nRemoving {len(cuts)} region(s) totalling {removed_s:.2f}s "
-          f"({removed_s / clip.duration * 100:.1f}% of original).")
-    print(f"Output duration: ~{clip.duration - removed_s:.2f}s\n")
+    removed = sum(e - s for s, e in cuts)
+    print(f"Removing {len(cuts)} region(s)  |  {removed:.1f}s cut  "
+          f"({removed / clip.duration * 100:.1f}% of original)")
+    print(f"Output duration: ~{clip.duration - removed:.1f}s\n")
 
     subclips = [clip.subclipped(s, e) for s, e in keep]
     final = concatenate_videoclips(subclips)
     final.write_videofile(output_path, logger="bar")
+
     clip.close()
     final.close()
 
@@ -218,61 +228,57 @@ def edit_video(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Remove duplicate words, stutters, and repeated phrases from a video.",
+        description="Remove back-to-back duplicate sentences and phrases from a video.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("input", help="Input video file (mp4, mkv, mov, …)")
+    parser.add_argument("input",
+                        help="Input video file (mp4, mkv, mov, …)")
     parser.add_argument("--output", "-o", default=None,
-                        help="Output path (default: <input>_deduped.mp4)")
+                        help="Output path (default: <input>_clean.mp4)")
     parser.add_argument("--model", "-m", default="base",
                         choices=["tiny", "base", "small", "medium", "large"],
-                        help="Whisper model  —  tiny/base: fast; small/medium: more accurate")
-    parser.add_argument("--max-phrase", type=int, default=8,
-                        help="Max phrase length in words to compare for repeats")
-    parser.add_argument("--min-similarity", type=float, default=0.85,
-                        help="Similarity ratio (0–1) for two phrases to be treated as a repeat")
-    parser.add_argument("--max-gap", type=float, default=4.0,
-                        help="Max seconds between two occurrences to be treated as a stutter")
-    parser.add_argument("--padding", type=float, default=0.04,
-                        help="Seconds kept on each side of every cut for a clean join")
+                        help="Whisper model — tiny: fastest; small/medium: more accurate")
+    parser.add_argument("--threshold", "-t", type=float, default=0.80,
+                        help="Similarity ratio (0–1) to flag two phrases as a duplicate")
+    parser.add_argument("--max-window", type=int, default=3,
+                        help="Max consecutive segments to group into one phrase for comparison")
+    parser.add_argument("--padding", "-p", type=float, default=0.05,
+                        help="Seconds of audio kept on each side of a cut for a clean join")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Transcribe and print detected duplicates without editing the video")
+                        help="Print detected duplicates without editing the video")
     args = parser.parse_args()
 
     input_path = Path(args.input)
     if not input_path.exists():
         sys.exit(f"File not found: {input_path}")
 
-    output_path = args.output or str(input_path.parent / f"{input_path.stem}_deduped.mp4")
+    output_path = args.output or str(input_path.parent / f"{input_path.stem}_clean.mp4")
 
-    # ── Transcribe
-    words = transcribe(str(input_path), args.model)
-    if not words:
-        sys.exit("No speech found in transcript. Check that the video has audible speech.")
-    print(f"\nTranscript: {len(words)} words detected.\n")
+    # 1. Extract audio (MoviePy → WAV → numpy, no system ffmpeg)
+    audio = extract_audio(str(input_path))
 
-    # ── Detect
+    # 2. Transcribe at segment level (numpy → Whisper, no system ffmpeg)
+    segments = transcribe(audio, args.model)
+    if not segments:
+        sys.exit("No speech detected. Check that the video has audible speech.")
+
+    # 3. Detect duplicates
     print("Scanning for duplicates...\n")
-    raw_cuts = find_cuts(
-        words,
-        max_phrase_len=args.max_phrase,
-        min_similarity=args.min_similarity,
-        max_gap=args.max_gap,
-    )
+    raw_cuts = find_cuts(segments, args.threshold, args.max_window)
 
     if not raw_cuts:
-        print("\nNo duplicates detected — video is already clean.")
+        print("No duplicates found — video is already clean.")
         sys.exit(0)
 
     cuts = merge_adjacent(raw_cuts)
-    print(f"\n{len(cuts)} cut region(s) after merging.")
+    print(f"\n{len(cuts)} region(s) to cut.")
 
     if args.dry_run:
-        print("\n--dry-run: skipping video export.")
+        print("\n--dry-run: no video was written.")
         sys.exit(0)
 
-    # ── Edit
-    edit_video(str(input_path), output_path, cuts, args.padding)
+    # 4. Splice and export
+    export_video(str(input_path), output_path, cuts, args.padding)
     print(f"\nDone. Saved to: {output_path}")
 
 
