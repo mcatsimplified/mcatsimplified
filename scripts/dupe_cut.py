@@ -50,8 +50,21 @@ def load_audio_array(video_path: str) -> "np.ndarray":
     if samples.ndim > 1:
         samples = samples.mean(axis=1)
 
-    # Whisper expects float32 in the range [-1, 1]
-    return samples.astype("float32")
+    samples = samples.astype(np.float32)
+
+    # MoviePy may return int16-range values (~±32768) or float values (~±1.0).
+    # Whisper requires float32 strictly in [-1, 1] — anything outside that range
+    # is treated as clipped noise and Whisper returns no speech.
+    peak = np.abs(samples).max()
+    if peak > 1.0:
+        samples = samples / peak          # int16-range → float range
+    elif 0 < peak < 0.01:
+        samples = samples / peak * 0.9    # inaudibly quiet → boost it
+
+    print(f"Audio: {len(samples)/16_000:.1f}s, peak={peak:.4f}, "
+          f"normalized_peak={np.abs(samples).max():.4f}")
+
+    return np.ascontiguousarray(samples)
 
 
 def transcribe(video_path: str, model_name: str) -> list[dict]:
