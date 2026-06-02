@@ -24,7 +24,6 @@ What it keeps:
 
 import argparse
 import re
-import subprocess
 import sys
 import tempfile
 from difflib import SequenceMatcher
@@ -34,11 +33,32 @@ from pathlib import Path
 # ── Transcription ─────────────────────────────────────────────────────────────
 
 def extract_audio(video_path: str, dest: str) -> None:
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", video_path,
-         "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", dest],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    from moviepy import VideoFileClip
+    import numpy as np
+    import wave
+
+    clip = VideoFileClip(video_path)
+    if clip.audio is None:
+        clip.close()
+        raise ValueError(f"No audio track found in {video_path}")
+
+    # Whisper wants mono 16 kHz PCM — resample via to_soundarray then write WAV
+    TARGET_FPS = 16_000
+    samples = clip.audio.to_soundarray(fps=TARGET_FPS)
+    clip.close()
+
+    # Mix down to mono
+    if samples.ndim > 1:
+        samples = samples.mean(axis=1)
+
+    # Normalise to int16 range and clamp to avoid overflow
+    pcm = np.clip(samples * 32767, -32768, 32767).astype(np.int16)
+
+    with wave.open(dest, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)          # 16-bit = 2 bytes
+        wf.setframerate(TARGET_FPS)
+        wf.writeframes(pcm.tobytes())
 
 
 def transcribe(video_path: str, model_name: str) -> list[dict]:
