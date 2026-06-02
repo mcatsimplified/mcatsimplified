@@ -12,8 +12,8 @@ Flags:
                   Lower = more sensitive — quieter word tails are treated as speech, not silence.
                   Raise (e.g. 0.02) only if too much background noise is being kept.
     --min-silence Minimum continuous silence duration (seconds) to remove (default: 0.5).
-    --padding     Seconds of audio preserved on each side of a cut (default: 0.4).
-                  400ms ensures the trailing sound of a word is never clipped.
+    --padding     Seconds the keep region extends INTO the detected silence (default: 0.15).
+                  150ms captures any trailing word sounds without keeping dead air.
     --output, -o  Output path. Defaults to <input>_cut.mp4 in the same folder.
 """
 
@@ -48,12 +48,16 @@ def find_keep_segments(
     chunk_dur: float,
     threshold: float,
     min_silence: float,
-    padding: float,
+    tail_pad: float,
     total_duration: float,
 ) -> list[tuple[float, float]]:
     """
     Return (start, end) pairs (in seconds) of regions to keep.
-    Silence runs longer than min_silence are removed; padding is left at each edge.
+    Silence runs longer than min_silence are removed.
+
+    tail_pad extends each keep segment FORWARD into the silence so that
+    the trailing sounds of words are never clipped. The next keep segment
+    starts exactly when the silence ends — no leading speech is skipped.
     """
     # Collect silence regions
     silence_regions = []
@@ -80,16 +84,18 @@ def find_keep_segments(
     if not silence_regions:
         return [(0.0, total_duration)]
 
-    # Invert silence regions → keep regions, trimmed by padding
-    keep = []
+    # Invert silence regions → keep regions
+    # tail_pad extends each segment INTO the silence (preserves word tails).
+    # The next segment begins right at sil_end — no speech is skipped.
+    keep   = []
     cursor = 0.0
 
     for sil_start, sil_end in silence_regions:
-        # Floor with cursor so padding never produces a backwards/overlapping segment
-        seg_end = max(cursor, sil_start - padding)
-        if seg_end - cursor > 0.01:          # skip micro-segments < 10ms
+        seg_end = min(total_duration, sil_start + tail_pad)  # reach into silence
+        seg_end = max(cursor, seg_end)                        # never go backwards
+        if seg_end - cursor > 0.01:
             keep.append((cursor, seg_end))
-        cursor = min(total_duration, sil_end + padding)
+        cursor = min(total_duration, sil_end)                 # resume at silence end
 
     if total_duration - cursor > 0.01:
         keep.append((cursor, total_duration))
@@ -116,14 +122,14 @@ def cut_silence(
     audio_arr = clip.audio.to_soundarray(fps=clip.audio.fps)
     rms, chunk_dur = rms_over_time(audio_arr, clip.audio.fps)
 
-    print(f"Threshold: {threshold} RMS | Min silence: {min_silence}s | Padding: {padding}s")
+    print(f"Threshold: {threshold} RMS | Min silence: {min_silence}s | Tail pad: {padding}s")
 
     keep = find_keep_segments(
         rms=rms,
         chunk_dur=chunk_dur,
         threshold=threshold,
         min_silence=min_silence,
-        padding=padding,
+        tail_pad=padding,
         total_duration=clip.duration,
     )
 
@@ -159,9 +165,9 @@ def main():
                              "(lower = more sensitive, preserves quiet word tails)")
     parser.add_argument("--min-silence", "-s", type=float, default=0.5,
                         help="Minimum silence duration in seconds to cut")
-    parser.add_argument("--padding", "-p", type=float, default=0.4,
-                        help="Seconds of audio preserved on each side of a cut "
-                             "(400ms default prevents trailing word clipping)")
+    parser.add_argument("--padding", "-p", type=float, default=0.15,
+                        help="Seconds the keep region extends INTO the silence to "
+                             "preserve word tails (default 0.15s = 150ms)")
     args = parser.parse_args()
 
     input_path = Path(args.input)
