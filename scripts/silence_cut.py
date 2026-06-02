@@ -5,13 +5,15 @@ silence_cut.py — Remove silent segments from a video using MoviePy.
 Usage:
     python scripts/silence_cut.py input.mp4
     python scripts/silence_cut.py input.mp4 --output trimmed.mp4
-    python scripts/silence_cut.py input.mp4 --threshold 0.02 --min-silence 0.5 --padding 0.05
+    python scripts/silence_cut.py input.mp4 --threshold 0.008 --min-silence 0.5 --padding 0.4
 
 Flags:
-    --threshold   RMS volume level below which audio counts as silent (default: 0.02).
-                  Lower = more aggressive cutting. Try 0.01–0.05.
+    --threshold   RMS volume level below which audio counts as silent (default: 0.008).
+                  Lower = more sensitive — quieter word tails are treated as speech, not silence.
+                  Raise (e.g. 0.02) only if too much background noise is being kept.
     --min-silence Minimum continuous silence duration (seconds) to remove (default: 0.5).
-    --padding     Seconds of audio kept before/after each cut to avoid clipping words (default: 0.05).
+    --padding     Seconds of audio preserved on each side of a cut (default: 0.4).
+                  400ms ensures the trailing sound of a word is never clipped.
     --output, -o  Output path. Defaults to <input>_cut.mp4 in the same folder.
 """
 
@@ -83,7 +85,8 @@ def find_keep_segments(
     cursor = 0.0
 
     for sil_start, sil_end in silence_regions:
-        seg_end = sil_start - padding
+        # Floor with cursor so padding never produces a backwards/overlapping segment
+        seg_end = max(cursor, sil_start - padding)
         if seg_end - cursor > 0.01:          # skip micro-segments < 10ms
             keep.append((cursor, seg_end))
         cursor = min(total_duration, sil_end + padding)
@@ -151,12 +154,14 @@ def main():
     parser.add_argument("input", help="Input video file (mp4, mkv, mov, …)")
     parser.add_argument("--output", "-o", default=None,
                         help="Output file path (default: <input>_cut.mp4)")
-    parser.add_argument("--threshold", "-t", type=float, default=0.02,
-                        help="RMS volume threshold below which audio is silent")
+    parser.add_argument("--threshold", "-t", type=float, default=0.008,
+                        help="RMS volume threshold below which audio is silent "
+                             "(lower = more sensitive, preserves quiet word tails)")
     parser.add_argument("--min-silence", "-s", type=float, default=0.5,
                         help="Minimum silence duration in seconds to cut")
-    parser.add_argument("--padding", "-p", type=float, default=0.05,
-                        help="Seconds of audio to keep on each side of a cut")
+    parser.add_argument("--padding", "-p", type=float, default=0.4,
+                        help="Seconds of audio preserved on each side of a cut "
+                             "(400ms default prevents trailing word clipping)")
     args = parser.parse_args()
 
     input_path = Path(args.input)
