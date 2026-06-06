@@ -45,8 +45,8 @@ export const LowerThird: React.FC<LowerThirdProps> = ({
     <div
       style={{
         position: "absolute",
-        left: 60,
-        bottom: 80,
+        left: 50,
+        bottom: 100,
         transform: `translateY(${translateY}px)`,
         opacity,
         display: "flex",
